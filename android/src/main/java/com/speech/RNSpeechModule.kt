@@ -4,13 +4,14 @@ import java.util.UUID
 import java.util.Locale
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.content.Intent
 import android.content.Context
 import android.speech.tts.Voice
 import android.media.AudioManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
-import android.annotation.SuppressLint
 import android.speech.tts.TextToSpeech
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
@@ -19,6 +20,7 @@ import com.facebook.react.bridge.ReadableMap
 import android.speech.tts.UtteranceProgressListener
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.module.annotations.ReactModule
+import android.util.Log
 
 @ReactModule(name = RNSpeechModule.NAME)
 class RNSpeechModule(reactContext: ReactApplicationContext) :
@@ -36,6 +38,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   companion object {
     const val NAME = "RNSpeech"
+    private const val TAG = "RNSpeech"
 
     private val defaultOptions: Map<String, Any> = mapOf(
       "rate" to 0.5f,
@@ -45,9 +48,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       "language" to Locale.getDefault().toLanguageTag()
     )
   }
+  
   private val queueLock = Any()
   private val maxInputLength = TextToSpeech.getMaxSpeechInputLength()
   private val isSupportedPausing = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+  private val mainHandler = Handler(Looper.getMainLooper())
 
   private lateinit var synthesizer: TextToSpeech
 
@@ -174,86 +179,130 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  // NEW: Verify that TTS is actually ready with voices loaded
+  private fun verifyTTSReady(retryCount: Int = 0) {
+    val maxRetries = 10
+    
+    mainHandler.postDelayed({
+      try {
+        val voices = synthesizer.voices
+        val engines = synthesizer.engines
+        
+        if (voices != null && voices.isNotEmpty() && engines != null && engines.isNotEmpty()) {
+          // Success - TTS is ready
+          Log.d(TAG, "TTS verified ready with ${voices.size} voices and ${engines.size} engines")
+          cachedEngines = engines
+          
+          synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String) {
+              synchronized(queueLock) {
+                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                  item.status = SpeechStatus.SPEAKING
+                  if (isResuming && item.position > 0) {
+                    emitOnResume(getEventData(utteranceId))
+                    isResuming = false
+                  } else {
+                    emitOnStart(getEventData(utteranceId))
+                  }
+                }
+              }
+            }
+            override fun onDone(utteranceId: String) {
+              synchronized(queueLock) {
+                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                  item.status = SpeechStatus.COMPLETED
+                  deactivateDuckingSession()
+                  emitOnFinish(getEventData(utteranceId))
+                  if (!isPaused) {
+                    currentQueueIndex++
+                    processNextQueueItem()
+                  }
+                }
+              }
+            }
+            override fun onError(utteranceId: String) {
+              synchronized(queueLock) {
+                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                  item.status = SpeechStatus.ERROR
+                  deactivateDuckingSession()
+                  emitOnError(getEventData(utteranceId))
+                  if (!isPaused) {
+                    currentQueueIndex++
+                    processNextQueueItem()
+                  }
+                }
+              }
+            }
+            override fun onStop(utteranceId: String, interrupted: Boolean) {
+              synchronized(queueLock) {
+                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                  if (isPaused) {
+                    item.status = SpeechStatus.PAUSED
+                    emitOnPause(getEventData(utteranceId))
+                  } else {
+                    item.status = SpeechStatus.COMPLETED
+                    emitOnStopped(getEventData(utteranceId))
+                  }
+                }
+              }
+            }
+            override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
+              synchronized(queueLock) {
+                speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                  item.position = item.offset + start
+                  val data = Arguments.createMap().apply {
+                    putInt("id", utteranceId.hashCode())
+                    putInt("length", end - start)
+                    putInt("location", item.position)
+                  }
+                  emitOnProgress(data)
+                }
+              }
+            }
+          })
+          
+          applyGlobalOptions()
+          isInitialized = true
+          isInitializing = false
+          processPendingOperations()
+          
+        } else if (retryCount < maxRetries) {
+          // Retry - voices not ready yet
+          Log.w(TAG, "TTS not ready yet (retry ${retryCount + 1}/$maxRetries), voices=${voices?.size ?: 0}, engines=${engines?.size ?: 0}")
+          verifyTTSReady(retryCount + 1)
+        } else {
+          // Failed after all retries
+          Log.e(TAG, "TTS initialization failed after $maxRetries retries")
+          isInitialized = false
+          isInitializing = false
+          rejectPendingOperations()
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error verifying TTS", e)
+        if (retryCount < maxRetries) {
+          verifyTTSReady(retryCount + 1)
+        } else {
+          isInitialized = false
+          isInitializing = false
+          rejectPendingOperations()
+        }
+      }
+    }, if (retryCount == 0) 500L else 1000L) // Initial delay 500ms, then 1s between retries
+  }
+
   private fun initializeTTS() {
     if (isInitializing) return
     isInitializing = true
 
     synthesizer = TextToSpeech(reactApplicationContext, { status ->
-      isInitialized = status == TextToSpeech.SUCCESS
-      isInitializing = false
-
-      if (isInitialized) {
-        cachedEngines = synthesizer.engines
-        synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-          override fun onStart(utteranceId: String) {
-            synchronized(queueLock) {
-              speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                item.status = SpeechStatus.SPEAKING
-                if (isResuming && item.position > 0) {
-                  emitOnResume(getEventData(utteranceId))
-                  isResuming = false
-                } else {
-                  emitOnStart(getEventData(utteranceId))
-                }
-              }
-            }
-          }
-          override fun onDone(utteranceId: String) {
-            synchronized(queueLock) {
-              speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                item.status = SpeechStatus.COMPLETED
-                deactivateDuckingSession()
-                emitOnFinish(getEventData(utteranceId))
-                if (!isPaused) {
-                  currentQueueIndex++
-                  processNextQueueItem()
-                }
-              }
-            }
-          }
-          override fun onError(utteranceId: String) {
-            synchronized(queueLock) {
-              speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                item.status = SpeechStatus.ERROR
-                deactivateDuckingSession()
-                emitOnError(getEventData(utteranceId))
-                if (!isPaused) {
-                  currentQueueIndex++
-                  processNextQueueItem()
-                }
-              }
-            }
-          }
-          override fun onStop(utteranceId: String, interrupted: Boolean) {
-            synchronized(queueLock) {
-              speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                if (isPaused) {
-                  item.status = SpeechStatus.PAUSED
-                  emitOnPause(getEventData(utteranceId))
-                } else {
-                  item.status = SpeechStatus.COMPLETED
-                  emitOnStopped(getEventData(utteranceId))
-                }
-              }
-            }
-          }
-          override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
-            synchronized(queueLock) {
-              speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
-                item.position = item.offset + start
-                val data = Arguments.createMap().apply {
-                  putInt("id", utteranceId.hashCode())
-                  putInt("length", end - start)
-                  putInt("location", item.position)
-                }
-                emitOnProgress(data)
-              }
-            }
-          }
-        })
-        applyGlobalOptions()
-        processPendingOperations()
+      if (status == TextToSpeech.SUCCESS) {
+        // Don't set isInitialized yet - wait for verification
+        Log.d(TAG, "TTS engine callback SUCCESS, verifying voices...")
+        verifyTTSReady()
       } else {
+        Log.e(TAG, "TTS engine initialization failed with status: $status")
+        isInitialized = false
+        isInitializing = false
         rejectPendingOperations()
       }
     }, selectedEngine)
@@ -565,9 +614,21 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         return
       }
     }
+    
+    // Shutdown existing TTS before switching engines
+    if (::synthesizer.isInitialized) {
+      try {
+        synthesizer.stop()
+        synthesizer.shutdown()
+      } catch (e: Exception) {
+        Log.w(TAG, "Error shutting down TTS before engine switch", e)
+      }
+    }
+    
     selectedEngine = engineName
-
-    invalidate()
+    isInitialized = false
+    isInitializing = false
+    resetQueueState()
 
     pendingOperations.add(Pair({ promise.resolve(null) }, promise))
     initializeTTS()
@@ -594,11 +655,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun invalidate() {
     super.invalidate()
+    mainHandler.removeCallbacksAndMessages(null)
     if (::synthesizer.isInitialized) {
       synthesizer.stop()
       synthesizer.shutdown()
       resetQueueState()
     }
     isInitialized = false
+    isInitializing = false
   }
 }
