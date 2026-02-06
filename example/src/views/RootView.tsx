@@ -34,6 +34,8 @@ const RootView: React.FC = () => {
     Array<HighlightedSegmentProps>
   >([]);
 
+  const targetId = React.useRef<string>('');
+
   React.useEffect(() => {
     // Speech.initialize({silentMode: 'obey', ducking: true});
 
@@ -41,38 +43,51 @@ const RootView: React.FC = () => {
       setIsStarted(false);
       setIsPaused(false);
       setHighlights([]);
+      targetId.current = '';
     };
 
     const startSubscription = Speech.onStart(({id}) => {
-      setIsStarted(true);
-      console.log(`Speech ${id} started`);
+      if (id === targetId.current) {
+        setIsStarted(true);
+        console.log(`Speech ${id} started`);
+      }
     });
     const finishSubscription = Speech.onFinish(({id}) => {
-      onSpeechEnd();
-      console.log(`Speech ${id} finished`);
+      if (id === targetId.current) {
+        onSpeechEnd();
+        console.log(`Speech ${id} finished`);
+      }
     });
     const pauseSubscription = Speech.onPause(({id}) => {
-      setIsPaused(true);
-      console.log(`Speech ${id} paused`);
+      if (id === targetId.current) {
+        setIsPaused(true);
+        console.log(`Speech ${id} paused`);
+      }
     });
     const resumeSubscription = Speech.onResume(({id}) => {
-      setIsPaused(false);
-      console.log(`Speech ${id} resumed`);
+      if (id === targetId.current) {
+        setIsPaused(false);
+        console.log(`Speech ${id} resumed`);
+      }
     });
     const stoppedSubscription = Speech.onStopped(({id}) => {
-      onSpeechEnd();
-      console.log(`Speech ${id} stopped`);
+      if (id === targetId.current) {
+        onSpeechEnd();
+        console.log(`Speech ${id} stopped`);
+      }
     });
     const progressSubscription = Speech.onProgress(({id, location, length}) => {
-      setHighlights([
-        {
-          start: location,
-          end: location + length,
-        },
-      ]);
-      console.log(
-        `Speech ${id} progress, current word length: ${length}, current char position: ${location}`,
-      );
+      if (id === targetId.current) {
+        setHighlights([
+          {
+            start: location,
+            end: location + length,
+          },
+        ]);
+        console.log(
+          `Speech ${id} progress, current word length: ${length}, current char position: ${location}`,
+        );
+      }
     });
 
     // (async () => {
@@ -102,7 +117,8 @@ const RootView: React.FC = () => {
   }, []);
 
   const onStartPress = React.useCallback(async () => {
-    await Speech.speak(Introduction);
+    const id = await Speech.speak(Introduction);
+    targetId.current = id;
   }, []);
 
   const onHighlightedPress = React.useCallback(

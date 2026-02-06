@@ -85,8 +85,9 @@ import Speech from '@mhpdev/react-native-speech';
 import {SafeAreaView, StyleSheet, Text, TouchableOpacity} from 'react-native';
 
 const App: React.FC = () => {
-  const onSpeakPress = () => {
-    Speech.speak('Hello World!');
+  const onSpeakPress = async () => {
+    const id = await Speech.speak('Hello World!');
+    console.log('Speech queued with id:', id);
   };
 
   return (

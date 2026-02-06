@@ -6,6 +6,7 @@ using namespace JS::NativeSpeech;
 {
   BOOL isDucking;
   NSDictionary *defaultOptions;
+  NSMutableDictionary *utteranceIdMap;
 }
 
 RCT_EXPORT_MODULE();
@@ -30,6 +31,8 @@ RCT_EXPORT_MODULE();
   if (self) {
     _synthesizer = [[AVSpeechSynthesizer alloc] init];
     _synthesizer.delegate = self;
+
+    utteranceIdMap = [[NSMutableDictionary alloc] init];
 
     defaultOptions = @{
       @"pitch": @(1.0),
@@ -98,9 +101,21 @@ RCT_EXPORT_MODULE();
 }
 
 - (NSDictionary *)getEventData:(AVSpeechUtterance *)utterance {
+  NSString *utteranceId = utteranceIdMap[@(utterance.hash).stringValue];
   return @{
-    @"id": @(utterance.hash)
+    @"id": utteranceId ?: @(utterance.hash).stringValue
   };
+}
+
+- (NSString *)generateAndMapUtteranceId:(AVSpeechUtterance *)utterance {
+  NSUUID *uuid = [[NSUUID alloc] init];
+  NSString *utteranceId = [uuid UUIDString];
+  utteranceIdMap[@(utterance.hash).stringValue] = utteranceId;
+  return utteranceId;
+}
+
+- (void)cleanupUtteranceId:(AVSpeechUtterance *)utterance {
+  [utteranceIdMap removeObjectForKey:@(utterance.hash).stringValue];
 }
 
 - (NSDictionary *)getVoiceItem:(AVSpeechSynthesisVoice *)voice {
@@ -258,12 +273,16 @@ RCT_EXPORT_MODULE();
     [self configureSilentModeSession:self.globalOptions[@"silentMode"]];
 
     utterance = [self getUtterance:text withOptions:self.globalOptions];
+    NSString *utteranceId = [self generateAndMapUtteranceId:utterance];
     [self.synthesizer speakUtterance:utterance];
-    resolve(nil);
+    resolve(utteranceId);
   }
   @catch (NSException *exception) {
     [self deactivateDuckingSession];
-    [self emitOnError:[self getEventData:utterance]];
+    if (utterance) {
+      [self emitOnError:[self getEventData:utterance]];
+      [self cleanupUtteranceId:utterance];
+    }
     reject(@"speech_error", exception.reason, nil);
   }
 }
@@ -288,12 +307,16 @@ RCT_EXPORT_MODULE();
     [self configureSilentModeSession:validatedOptions[@"silentMode"]];
     
     utterance = [self getUtterance:text withOptions:validatedOptions];
+    NSString *utteranceId = [self generateAndMapUtteranceId:utterance];
     [self.synthesizer speakUtterance:utterance];
-    resolve(nil);
+    resolve(utteranceId);
   }
   @catch (NSException *exception) {
     [self deactivateDuckingSession];
-    [self emitOnError:[self getEventData:utterance]];
+    if (utterance) {
+      [self emitOnError:[self getEventData:utterance]];
+      [self cleanupUtteranceId:utterance];
+    }
     reject(@"speech_error", exception.reason, nil);
   }
 }
@@ -305,17 +328,17 @@ RCT_EXPORT_MODULE();
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   willSpeakRangeOfSpeechString:(NSRange)characterRange utterance:(AVSpeechUtterance *)utterance {
-  [self emitOnProgress:@{
-    @"id": @(utterance.hash),
-    @"length": @(characterRange.length),
-    @"location": @(characterRange.location)
-  }];
+  NSMutableDictionary *progressData = [[self getEventData:utterance] mutableCopy];
+  progressData[@"length"] = @(characterRange.length);
+  progressData[@"location"] = @(characterRange.location);
+  [self emitOnProgress:progressData];
 }
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   didFinishSpeechUtterance:(AVSpeechUtterance *)utterance {
   [self deactivateDuckingSession];
   [self emitOnFinish:[self getEventData:utterance]];
+  [self cleanupUtteranceId:utterance];
 }
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
@@ -332,6 +355,7 @@ RCT_EXPORT_MODULE();
   didCancelSpeechUtterance:(AVSpeechUtterance *)utterance {
   [self deactivateDuckingSession];
   [self emitOnStopped:[self getEventData:utterance]];
+  [self cleanupUtteranceId:utterance];
 }
 
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:

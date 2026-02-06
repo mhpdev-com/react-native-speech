@@ -273,13 +273,24 @@ Speak a given text using the current global settings.
 **API Definition:**
 
 ```ts
-Speech.speak(text: string): Promise<void>
+Speech.speak(text: string): Promise<string>
 ```
+
+**Returns:**
+
+- A unique utterance ID (string) returned immediately when the utterance is queued. Use it to filter events for this specific speech operation.
 
 **Example Usage:**
 
 ```ts
-Speech.speak('Hello, world!');
+const id = await Speech.speak('Hello, world!');
+
+// Track events specific to this utterance
+Speech.onFinish(({id: eventId}) => {
+  if (eventId === id) {
+    console.log('Speech finished');
+  }
+});
 ```
 
 ---
@@ -291,16 +302,27 @@ Override global options for a specific utterance.
 **API Definition:**
 
 ```ts
-Speech.speakWithOptions(text: string, options: VoiceOptions): Promise<void>
+Speech.speakWithOptions(text: string, options: VoiceOptions): Promise<string>
 ```
+
+**Returns:**
+
+- A unique utterance ID (string) returned immediately when the utterance is queued. Use it to filter events for this specific speech operation.
 
 **Example Usage:**
 
 ```ts
-Speech.speakWithOptions('Hello!', {
+const id = await Speech.speakWithOptions('Hello!', {
   language: 'en-US',
   pitch: 1.5,
   rate: 0.8,
+});
+
+// Track events specific to this utterance
+Speech.onProgress(({id: eventId, location, length}) => {
+  if (eventId === id) {
+    console.log(`Progress: ${location}/${length}`);
+  }
 });
 ```
 
@@ -350,7 +372,28 @@ Speech.isSpeaking().then(isSpeaking => {
 
 ### Event Callbacks
 
-Subscribe to event callbacks for speech synthesis lifecycle monitoring.
+Subscribe to event callbacks for speech synthesis lifecycle monitoring. Each callback receives an `id` property that corresponds to the utterance ID returned by `speak()` or `speakWithOptions()`. This allows you to handle events for specific speech operations independently.
+
+**Why use utterance IDs?**
+
+Utterance IDs enable precise event tracking when handling multiple concurrent or sequential speech operations:
+
+```ts
+// Start first speech
+const id1 = await Speech.speak('Hello');
+
+// Start second speech
+const id2 = await Speech.speak('World');
+
+// Handle events only for the first speech
+Speech.onFinish(({id}) => {
+  if (id === id1) {
+    console.log('First speech finished');
+  } else if (id === id2) {
+    console.log('Second speech finished');
+  }
+});
+```
 
 #### **onError**
 

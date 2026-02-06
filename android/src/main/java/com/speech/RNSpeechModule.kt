@@ -162,7 +162,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private fun getEventData(utteranceId: String): ReadableMap {
     return Arguments.createMap().apply {
-      putInt("id", utteranceId.hashCode())
+      putString("id", utteranceId)
     }
   }
 
@@ -299,7 +299,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                     speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
                       item.position = item.offset + start
                       val data = Arguments.createMap().apply {
-                        putInt("id", utteranceId.hashCode())
+                        putString("id", utteranceId)
                         putInt("length", end - start)
                         putInt("location", item.position)
                       }
@@ -543,7 +543,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
           processNextQueueItem()
         }
       }
-      promise.resolve(null)
+      promise.resolve(utteranceId)
     }
   }
 
@@ -573,7 +573,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
           processNextQueueItem()
         }
       }
-      promise.resolve(null)
+      promise.resolve(utteranceId)
     }
   }
 

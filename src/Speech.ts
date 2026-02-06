@@ -135,31 +135,39 @@ export default class Speech {
   /**
    * Speaks text using current global options
    * @param text - The text to synthesize
-   * @returns Promise<void> Resolves when speech completes
+   * @returns Promise<string> Resolves with utterance ID when the utterance is queued
    * @throws If text is null or undefined
    * @example
-   * await Speech.speak('Hello, world!');
+   * const id = await Speech.speak('Hello, world!');
+   * // Later, use this ID to track events:
+   * Speech.onFinish(({id: eventId}) => {
+   *   if (eventId === id) console.log('My speech finished');
+   * });
    */
-  public static speak(text: string): Promise<void> {
+  public static speak(text: string): Promise<string> {
     return TurboSpeech.speak(text);
   }
   /**
    * Speaks text with custom options for this utterance only. Uses global options for any settings not provided.
    * @param text - The text to synthesize
    * @param options - Voice options overriding global settings
-   * @returns Promise<void> Resolves when speech completes
+   * @returns Promise<string> Resolves with utterance ID when the utterance is queued
    * @throws If text is null or undefined
    * @example
-   * await Speech.speakWithOptions('Hello!', {
+   * const id = await Speech.speakWithOptions('Hello!', {
    *   pitch: 1.5,
    *   rate: 0.8,
    *   language: 'en-US'
+   * });
+   * // Later, use this ID to track events:
+   * Speech.onFinish(({id: eventId}) => {
+   *   if (eventId === id) console.log('My speech finished');
    * });
    */
   public static speakWithOptions(
     text: string,
     options: VoiceOptions,
-  ): Promise<void> {
+  ): Promise<string> {
     return TurboSpeech.speakWithOptions(text, options);
   }
 

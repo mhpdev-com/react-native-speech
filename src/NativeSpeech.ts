@@ -7,7 +7,7 @@ export interface EventProps {
   /**
    * The utterance ID
    */
-  id: number;
+  id: string;
 }
 export interface ProgressEventProps extends EventProps {
   /**
@@ -97,13 +97,13 @@ export interface Spec extends TurboModule {
   pause: () => Promise<boolean>;
   resume: () => Promise<boolean>;
   isSpeaking: () => Promise<boolean>;
-  speak: (text: string) => Promise<void>;
+  speak: (text: string) => Promise<string>;
   getEngines: () => Promise<EngineProps[]>;
   initialize: (options: VoiceOptions) => void;
   openVoiceDataInstaller: () => Promise<void>;
   setEngine: (engineName: string) => Promise<void>;
   getAvailableVoices: (language?: string) => Promise<VoiceProps[]>;
-  speakWithOptions: (text: string, options: VoiceOptions) => Promise<void>;
+  speakWithOptions: (text: string, options: VoiceOptions) => Promise<string>;
   //Listeners
   readonly onError: EventEmitter<EventProps>;
   readonly onStart: EventEmitter<EventProps>;
