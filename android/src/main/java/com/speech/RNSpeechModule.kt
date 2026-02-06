@@ -74,8 +74,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private var isPaused = false
   private var isResuming = false
-  private var currentQueueIndex = -1
-  private val speechQueue = mutableListOf<SpeechQueueItem>()
+  private var currentUtteranceId: String? = null
+  private val speechQueue = LinkedHashMap<String, SpeechQueueItem>()
 
   private val audioManager: AudioManager by lazy {
     reactApplicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -183,9 +183,34 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private fun resetQueueState() {
     synchronized(queueLock) {
       speechQueue.clear()
-      currentQueueIndex = -1
+      currentUtteranceId = null
       isPaused = false
       isResuming = false
+    }
+  }
+
+  private fun getItemDucking(item: SpeechQueueItem): Boolean {
+    return (item.options["ducking"] as? Boolean)
+      ?: (globalOptions["ducking"] as? Boolean)
+      ?: false
+  }
+
+  private fun cleanupQueueHeadLocked() {
+    val iterator = speechQueue.entries.iterator()
+    while (iterator.hasNext()) {
+      val entry = iterator.next()
+      val status = entry.value.status
+      if (status == SpeechStatus.COMPLETED || status == SpeechStatus.ERROR) {
+        if (currentUtteranceId == entry.key) {
+          currentUtteranceId = null
+        }
+        iterator.remove()
+      } else {
+        break
+      }
+    }
+    if (speechQueue.isEmpty()) {
+      currentUtteranceId = null
     }
   }
 
@@ -244,7 +269,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
               synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String) {
                   synchronized(queueLock) {
-                    speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                    speechQueue[utteranceId]?.let { item ->
                       item.status = SpeechStatus.SPEAKING
                       if (isResuming && item.position > 0) {
                         emitOnResume(getEventData(utteranceId))
@@ -257,12 +282,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                 }
                 override fun onDone(utteranceId: String) {
                   synchronized(queueLock) {
-                    speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                    speechQueue[utteranceId]?.let { item ->
                       item.status = SpeechStatus.COMPLETED
                       deactivateDuckingSession()
                       emitOnFinish(getEventData(utteranceId))
                       if (!isPaused) {
-                        currentQueueIndex++
+                        currentUtteranceId = null
+                        cleanupQueueHeadLocked()
                         processNextQueueItem()
                       }
                     }
@@ -270,12 +296,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                 }
                 override fun onError(utteranceId: String) {
                   synchronized(queueLock) {
-                    speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                    speechQueue[utteranceId]?.let { item ->
                       item.status = SpeechStatus.ERROR
                       deactivateDuckingSession()
                       emitOnError(getEventData(utteranceId))
                       if (!isPaused) {
-                        currentQueueIndex++
+                        currentUtteranceId = null
+                        cleanupQueueHeadLocked()
                         processNextQueueItem()
                       }
                     }
@@ -283,20 +310,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                 }
                 override fun onStop(utteranceId: String, interrupted: Boolean) {
                   synchronized(queueLock) {
-                    speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                    speechQueue[utteranceId]?.let { item ->
                       if (isPaused) {
                         item.status = SpeechStatus.PAUSED
                         emitOnPause(getEventData(utteranceId))
                       } else {
                         item.status = SpeechStatus.COMPLETED
+                        deactivateDuckingSession()
                         emitOnStopped(getEventData(utteranceId))
+                        currentUtteranceId = null
+                        cleanupQueueHeadLocked()
                       }
                     }
                   }
                 }
                 override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
                   synchronized(queueLock) {
-                    speechQueue.find { it.utteranceId == utteranceId }?.let { item ->
+                    speechQueue[utteranceId]?.let { item ->
                       item.position = item.offset + start
                       val data = Arguments.createMap().apply {
                         putString("id", utteranceId)
@@ -396,34 +426,34 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private fun processNextQueueItem() {
     synchronized(queueLock) {
       if (isPaused || !isInitialized) return
-      if (currentQueueIndex in 0 until speechQueue.size) {
-        val item = speechQueue[currentQueueIndex]
-        if (item.status == SpeechStatus.PENDING || item.status == SpeechStatus.PAUSED) {
-          applyOptions(item.options)
-          val textToSpeak = if (item.status == SpeechStatus.PAUSED) {
-            item.offset = item.position
-            isResuming = true
-            item.text.substring(item.offset)
-          } else {
-            item.offset = 0
-            item.text
-          }
-          val queueMode = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-          try {
-            synthesizer.speak(textToSpeak, queueMode, getSpeechParams(), item.utteranceId)
-          } catch (e: Exception) {
-            item.status = SpeechStatus.ERROR
-            currentQueueIndex++
-            processNextQueueItem()
-          }
-          if (currentQueueIndex == speechQueue.size - 1) applyGlobalOptions()
-        } else {
-          currentQueueIndex++
-          processNextQueueItem()
-        }
-      } else {
-        currentQueueIndex = -1
+      var item = currentUtteranceId?.let { speechQueue[it] }
+      if (item == null || (item.status != SpeechStatus.PENDING && item.status != SpeechStatus.PAUSED)) {
+        item = speechQueue.values.firstOrNull { it.status == SpeechStatus.PENDING || it.status == SpeechStatus.PAUSED }
+        currentUtteranceId = item?.utteranceId
+      }
+      if (item == null) {
         applyGlobalOptions()
+        return
+      }
+      isDucking = getItemDucking(item)
+      activateDuckingSession()
+      applyOptions(item.options)
+      val textToSpeak = if (item.status == SpeechStatus.PAUSED) {
+        item.offset = item.position
+        isResuming = true
+        item.text.substring(item.offset)
+      } else {
+        item.offset = 0
+        item.text
+      }
+      val queueMode = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+      try {
+        synthesizer.speak(textToSpeak, queueMode, getSpeechParams(), item.utteranceId)
+      } catch (e: Exception) {
+        item.status = SpeechStatus.ERROR
+        currentUtteranceId = null
+        cleanupQueueHeadLocked()
+        processNextQueueItem()
       }
     }
   }
@@ -472,9 +502,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         try { synthesizer.stop() } catch (e: Exception) {}
         deactivateDuckingSession()
         synchronized(queueLock) {
-          if (currentQueueIndex in speechQueue.indices) {
-            emitOnStopped(getEventData(speechQueue[currentQueueIndex].utteranceId))
-          }
+          currentUtteranceId?.let { emitOnStopped(getEventData(it)) }
           resetQueueState()
         }
       }
@@ -498,16 +526,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun resume(promise: Promise) {
     ensureInitialized(promise) {
-      if (!isSupportedPausing || !isPaused || speechQueue.isEmpty() || currentQueueIndex < 0) {
+      if (!isSupportedPausing || !isPaused || speechQueue.isEmpty() || currentUtteranceId == null) {
         promise.resolve(false)
         return@ensureInitialized
       }
       synchronized(queueLock) {
-        val pausedIdx = speechQueue.indexOfFirst { it.status == SpeechStatus.PAUSED }
-        if (pausedIdx >= 0) {
-          currentQueueIndex = pausedIdx
+        val pausedItem = speechQueue.values.firstOrNull { it.status == SpeechStatus.PAUSED }
+        if (pausedItem != null) {
+          currentUtteranceId = pausedItem.utteranceId
+          isDucking = getItemDucking(pausedItem)
           isPaused = false
-          activateDuckingSession()
           processNextQueueItem()
           promise.resolve(true)
         } else {
@@ -531,15 +559,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       return
     }
     ensureInitialized(promise) {
-      isDucking = globalOptions["ducking"] as? Boolean ?: false
-      activateDuckingSession()
       val utteranceId = getUniqueID()
       val item = SpeechQueueItem(text = text, options = emptyMap(), utteranceId = utteranceId)
       synchronized(queueLock) {
-        speechQueue.add(item)
+        speechQueue[utteranceId] = item
         val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
         if (!engineBusy && !isPaused) {
-          currentQueueIndex = speechQueue.size - 1
+          currentUtteranceId = utteranceId
           processNextQueueItem()
         }
       }
@@ -561,15 +587,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     }
     ensureInitialized(promise) {
       val validated = getValidatedOptions(options)
-      isDucking = validated["ducking"] as? Boolean ?: false
-      activateDuckingSession()
       val utteranceId = getUniqueID()
       val item = SpeechQueueItem(text = text, options = validated, utteranceId = utteranceId)
       synchronized(queueLock) {
-        speechQueue.add(item)
+        speechQueue[utteranceId] = item
         val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
         if (!engineBusy && !isPaused) {
-          currentQueueIndex = speechQueue.size - 1
+          currentUtteranceId = utteranceId
           processNextQueueItem()
         }
       }

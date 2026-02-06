@@ -6,7 +6,8 @@ using namespace JS::NativeSpeech;
 {
   BOOL isDucking;
   NSDictionary *defaultOptions;
-  NSMutableDictionary *utteranceIdMap;
+  NSMutableDictionary *utteranceMetaMap;
+  dispatch_queue_t utteranceMapQueue;
 }
 
 RCT_EXPORT_MODULE();
@@ -32,7 +33,8 @@ RCT_EXPORT_MODULE();
     _synthesizer = [[AVSpeechSynthesizer alloc] init];
     _synthesizer.delegate = self;
 
-    utteranceIdMap = [[NSMutableDictionary alloc] init];
+    utteranceMetaMap = [[NSMutableDictionary alloc] init];
+    utteranceMapQueue = dispatch_queue_create("com.mhpdev.speech.utteranceMapQueue", DISPATCH_QUEUE_SERIAL);
 
     defaultOptions = @{
       @"pitch": @(1.0),
@@ -101,21 +103,60 @@ RCT_EXPORT_MODULE();
 }
 
 - (NSDictionary *)getEventData:(AVSpeechUtterance *)utterance {
-  NSString *utteranceId = utteranceIdMap[@(utterance.hash).stringValue];
+  NSString *key = @(utterance.hash).stringValue;
+  __block NSDictionary *meta = nil;
+  dispatch_sync(utteranceMapQueue, ^{
+    meta = utteranceMetaMap[key];
+  });
+  NSString *utteranceId = meta[@"id"];
   return @{
-    @"id": utteranceId ?: @(utterance.hash).stringValue
+    @"id": utteranceId ?: key
   };
 }
 
 - (NSString *)generateAndMapUtteranceId:(AVSpeechUtterance *)utterance {
   NSUUID *uuid = [[NSUUID alloc] init];
   NSString *utteranceId = [uuid UUIDString];
-  utteranceIdMap[@(utterance.hash).stringValue] = utteranceId;
+  NSString *key = @(utterance.hash).stringValue;
+  dispatch_sync(utteranceMapQueue, ^{
+    utteranceMetaMap[key] = [@{ @"id": utteranceId } mutableCopy];
+  });
   return utteranceId;
 }
 
+- (void)storeUtteranceOptions:(AVSpeechUtterance *)utterance
+                      ducking:(BOOL)ducking
+                   silentMode:(NSString *)silentMode {
+  NSString *key = @(utterance.hash).stringValue;
+  NSString *mode = silentMode ?: @"obey";
+  NSDictionary *options = @{
+    @"ducking": @(ducking),
+    @"silentMode": mode
+  };
+  dispatch_sync(utteranceMapQueue, ^{
+    NSMutableDictionary *meta = utteranceMetaMap[key];
+    if (!meta) {
+      meta = [[NSMutableDictionary alloc] init];
+      utteranceMetaMap[key] = meta;
+    }
+    [meta addEntriesFromDictionary:options];
+  });
+}
+
+- (NSDictionary *)getUtteranceOptions:(AVSpeechUtterance *)utterance {
+  NSString *key = @(utterance.hash).stringValue;
+  __block NSDictionary *meta = nil;
+  dispatch_sync(utteranceMapQueue, ^{
+    meta = utteranceMetaMap[key];
+  });
+  return meta;
+}
+
 - (void)cleanupUtteranceId:(AVSpeechUtterance *)utterance {
-  [utteranceIdMap removeObjectForKey:@(utterance.hash).stringValue];
+  NSString *key = @(utterance.hash).stringValue;
+  dispatch_sync(utteranceMapQueue, ^{
+    [utteranceMetaMap removeObjectForKey:key];
+  });
 }
 
 - (NSDictionary *)getVoiceItem:(AVSpeechSynthesisVoice *)voice {
@@ -267,13 +308,11 @@ RCT_EXPORT_MODULE();
   AVSpeechUtterance *utterance;
  
   @try {
-    isDucking = [self.globalOptions[@"ducking"] boolValue];
-
-    [self activateDuckingSession];
-    [self configureSilentModeSession:self.globalOptions[@"silentMode"]];
-
     utterance = [self getUtterance:text withOptions:self.globalOptions];
     NSString *utteranceId = [self generateAndMapUtteranceId:utterance];
+    BOOL ducking = [self.globalOptions[@"ducking"] boolValue];
+    NSString *silentMode = self.globalOptions[@"silentMode"];
+    [self storeUtteranceOptions:utterance ducking:ducking silentMode:silentMode];
     [self.synthesizer speakUtterance:utterance];
     resolve(utteranceId);
   }
@@ -301,13 +340,12 @@ RCT_EXPORT_MODULE();
 
   @try {
     NSDictionary *validatedOptions = [self getValidatedOptions:options];
-    isDucking = [validatedOptions[@"ducking"] boolValue];
-
-    [self activateDuckingSession];
-    [self configureSilentModeSession:validatedOptions[@"silentMode"]];
     
     utterance = [self getUtterance:text withOptions:validatedOptions];
     NSString *utteranceId = [self generateAndMapUtteranceId:utterance];
+    BOOL ducking = [validatedOptions[@"ducking"] boolValue];
+    NSString *silentMode = validatedOptions[@"silentMode"];
+    [self storeUtteranceOptions:utterance ducking:ducking silentMode:silentMode];
     [self.synthesizer speakUtterance:utterance];
     resolve(utteranceId);
   }
@@ -323,6 +361,12 @@ RCT_EXPORT_MODULE();
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
   didStartSpeechUtterance:(AVSpeechUtterance *)utterance {
+  NSDictionary *options = [self getUtteranceOptions:utterance];
+  BOOL ducking = [options[@"ducking"] boolValue];
+  NSString *silentMode = options[@"silentMode"] ?: @"obey";
+  isDucking = ducking;
+  [self configureSilentModeSession:silentMode];
+  [self activateDuckingSession];
   [self emitOnStart:[self getEventData:utterance]];
 }
 
