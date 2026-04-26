@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://mhpdev.com" target="_blank">
-    <img src="./docs/banner.png" alt="React Native Full Responsive Banner" style="max-width:100%;height:auto;" />
+    <img src="./docs/banner.png" alt="React Native Speech Banner" style="max-width:100%;height:auto;" />
   </a>
 </p>
 
