@@ -60,7 +60,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private lateinit var synthesizer: TextToSpeech
 
   private var selectedEngine: String? = null
-  private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
+  @Volatile private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
 
   @Volatile private var isInitialized = false
   @Volatile private var isInitializing = false
@@ -260,12 +260,6 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
           synthesizer = TextToSpeech(reactApplicationContext, { status ->
             clearInitTimeout()
             if (status == TextToSpeech.SUCCESS) {
-              synchronized(initLock) {
-                isInitialized = true
-                isInitializing = false
-                initRetryCount = 0
-              }
-              cachedEngines = try { synthesizer.engines } catch (e: Exception) { null }
               synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String) {
                   synchronized(queueLock) {
@@ -338,8 +332,24 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                   }
                 }
               })
-              applyGlobalOptions()
-              processPendingOperations()
+              // onInit runs on the main thread; the engine/voice enumeration
+              // below ANRs on low-end devices, so run it off-thread. Apply config before
+              // flipping the flag, and keep initLock to the flag flip only — holding it
+              // across a TextToSpeech call deadlocks (upstream #11).
+              Thread {
+                // a raw Thread crashes the app on an uncaught Throwable (e.g.
+                // a getVoices() OOM on a broken engine) — backstop the body.
+                try {
+                  cachedEngines = try { synthesizer.engines } catch (e: Throwable) { null }
+                  applyGlobalOptionsInternal()
+                  synchronized(initLock) {
+                    isInitialized = true
+                    isInitializing = false
+                    initRetryCount = 0
+                  }
+                  processPendingOperations()
+                } catch (t: Throwable) {}
+              }.start()
             } else {
               onInitFailure()
             }
@@ -383,6 +393,12 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private fun applyGlobalOptions() {
     if (!isInitialized) return
+    applyGlobalOptionsInternal()
+  }
+
+  // applyGlobalOptions() without the isInitialized guard, so the init worker can apply
+  // config before the barrier opens. Don't call under initLock — it touches TextToSpeech (#11).
+  private fun applyGlobalOptionsInternal() {
     try {
       globalOptions["language"]?.let {
         synthesizer.setLanguage(Locale.forLanguageTag(it as String))
@@ -396,7 +412,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       globalOptions["voice"]?.let { voiceId ->
         synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
       }
-    } catch (e: Exception) {}
+      // Throwable, not Exception — getVoices() can OutOfMemoryError on some engines.
+    } catch (e: Throwable) {}
   }
 
   private fun applyOptions(options: Map<String, Any>) {
@@ -409,7 +426,8 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       temp["voice"]?.let { voiceId ->
         synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
       }
-    } catch (e: Exception) {}
+      // Throwable, not Exception — getVoices() can OutOfMemoryError on some engines.
+    } catch (e: Throwable) {}
   }
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
@@ -605,11 +623,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     ensureInitialized(promise) {
       val enginesArray = Arguments.createArray()
       val engines = cachedEngines ?: try { synthesizer.engines } catch (e: Exception) { null }
+      // resolve defaultEngine once (a Binder IPC) instead of once per engine.
+      val defaultEngine = try { synthesizer.defaultEngine } catch (e: Exception) { "" }
       engines?.forEach { engine ->
         enginesArray.pushMap(Arguments.createMap().apply {
           putString("name", engine.name)
           putString("label", engine.label)
-          putBoolean("isDefault", engine.name == try { synthesizer.defaultEngine } catch (e: Exception) { "" })
+          putBoolean("isDefault", engine.name == defaultEngine)
         })
       }
       promise.resolve(enginesArray)
