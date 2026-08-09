@@ -11,11 +11,13 @@ import android.content.Context
 import android.speech.tts.Voice
 import android.media.AudioManager
 import android.media.AudioAttributes
+import java.util.concurrent.Executors
 import android.media.AudioFocusRequest
 import android.annotation.SuppressLint
 import android.speech.tts.TextToSpeech
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.Arguments
+import java.util.concurrent.ExecutorService
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.bridge.ReadableMap
 import android.speech.tts.UtteranceProgressListener
@@ -49,6 +51,13 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       "language" to Locale.getDefault().toLanguageTag()
     )
   }
+
+  private data class SpeakWork(
+    val item: SpeechQueueItem,
+    val text: String,
+    val queueMode: Int
+  )
+
   private val initLock = Any()
   private val queueLock = Any()
 
@@ -60,18 +69,21 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   private lateinit var synthesizer: TextToSpeech
 
   private var selectedEngine: String? = null
-  private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
+  @Volatile private var cachedEngines: List<TextToSpeech.EngineInfo>? = null
 
+  @Volatile private var initGeneration = 0
   @Volatile private var isInitialized = false
   @Volatile private var isInitializing = false
 
   private var initRetryCount = 0
+  private var isRetryScheduled = false
+  private var initRetryRunnable: Runnable? = null
   private var initTimeoutRunnable: Runnable? = null
+  private var initExecutor: ExecutorService? = null
 
   private val pendingOperations = mutableListOf<Pair<() -> Unit, Promise>>()
 
-  private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
-
+  @Volatile private var globalOptions: MutableMap<String, Any> = defaultOptions.toMutableMap()
   private var isPaused = false
   private var isResuming = false
   private var currentUtteranceId: String? = null
@@ -230,24 +242,63 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     initTimeoutRunnable = null
   }
 
+  private fun getInitExecutor(): ExecutorService = synchronized(initLock) {
+    initExecutor ?: Executors.newSingleThreadExecutor { r ->
+      Thread(r, "RNSpeech-Init").apply { isDaemon = true }
+    }.also { initExecutor = it }
+  }
+
   private fun onInitFailure() {
-    synchronized(initLock) {
+    val hadSynthesizer = synchronized(initLock) {
+      initGeneration++
       isInitializing = false
       isInitialized = false
-      if (::synthesizer.isInitialized) {
-        try {
-          synthesizer.shutdown()
-        } catch (e: Exception) {}
-      }
+      val had = ::synthesizer.isInitialized
       initRetryCount++
       if (initRetryCount <= MAX_INIT_RETRIES) {
         val delay = 1000L * (1 shl (initRetryCount - 1))
-        mainHandler.postDelayed({ createTTSInstance() }, delay)
+        val runnable = Runnable {
+          synchronized(initLock) {
+            isRetryScheduled = false
+            initRetryRunnable = null
+          }
+          createTTSInstance()
+        }
+        initRetryRunnable = runnable
+        isRetryScheduled = true
+        mainHandler.postDelayed(runnable, delay)
       } else {
         initRetryCount = 0
         rejectPendingOperations()
       }
+      had
     }
+    if (hadSynthesizer) {
+      try {
+        synthesizer.shutdown()
+      } catch (e: Exception) {}
+    }
+  }
+
+  private fun resetSynthesizer() {
+    val hadSynthesizer = synchronized(initLock) {
+      initGeneration++
+      val had = ::synthesizer.isInitialized
+      isInitialized = false
+      isInitializing = false
+      if (isRetryScheduled) {
+        initRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        initRetryRunnable = null
+        isRetryScheduled = false
+      }
+      clearInitTimeout()
+      had
+    }
+    if (hadSynthesizer) {
+      try { synthesizer.stop() } catch (e: Exception) {}
+      try { synthesizer.shutdown() } catch (e: Exception) {}
+    }
+    resetQueueState()
   }
 
   private fun createTTSInstance() {
@@ -255,17 +306,15 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       if (isInitializing) return
       isInitializing = true
       scheduleInitTimeout()
+      val generation = initGeneration
       mainHandler.post {
         try {
           synthesizer = TextToSpeech(reactApplicationContext, { status ->
             clearInitTimeout()
+            if (generation != initGeneration) {
+              return@TextToSpeech
+            }
             if (status == TextToSpeech.SUCCESS) {
-              synchronized(initLock) {
-                isInitialized = true
-                isInitializing = false
-                initRetryCount = 0
-              }
-              cachedEngines = try { synthesizer.engines } catch (e: Exception) { null }
               synthesizer.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String) {
                   synchronized(queueLock) {
@@ -281,6 +330,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                   }
                 }
                 override fun onDone(utteranceId: String) {
+                  var shouldAdvance = false
                   synchronized(queueLock) {
                     speechQueue[utteranceId]?.let { item ->
                       item.status = SpeechStatus.COMPLETED
@@ -289,12 +339,14 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                       if (!isPaused) {
                         currentUtteranceId = null
                         cleanupQueueHeadLocked()
-                        processNextQueueItem()
+                        shouldAdvance = true
                       }
                     }
                   }
+                  if (shouldAdvance) processNextQueueItem()
                 }
                 override fun onError(utteranceId: String) {
+                  var shouldAdvance = false
                   synchronized(queueLock) {
                     speechQueue[utteranceId]?.let { item ->
                       item.status = SpeechStatus.ERROR
@@ -303,10 +355,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                       if (!isPaused) {
                         currentUtteranceId = null
                         cleanupQueueHeadLocked()
-                        processNextQueueItem()
+                        shouldAdvance = true
                       }
                     }
                   }
+                  if (shouldAdvance) processNextQueueItem()
                 }
                 override fun onStop(utteranceId: String, interrupted: Boolean) {
                   synchronized(queueLock) {
@@ -338,8 +391,25 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
                   }
                 }
               })
-              applyGlobalOptions()
-              processPendingOperations()
+              getInitExecutor().execute {
+                if (generation != initGeneration) return@execute
+                try {
+                  cachedEngines = try { synthesizer.engines } catch (e: Throwable) { null }
+                  applyGlobalOptionsInternal()
+                  var opened = false
+                  synchronized(initLock) {
+                    if (generation == initGeneration) {
+                      isInitialized = true
+                      isInitializing = false
+                      initRetryCount = 0
+                      opened = true
+                    }
+                  }
+                  if (opened) processPendingOperations()
+                } catch (t: Throwable) {
+                  if (generation == initGeneration) onInitFailure()
+                }
+              }
             } else {
               onInitFailure()
             }
@@ -354,35 +424,42 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   private fun initializeTTS() {
     synchronized(initLock) {
-      if (isInitializing || isInitialized) return
+      if (isInitializing || isInitialized || isRetryScheduled) return
       initRetryCount = 0
       createTTSInstance()
     }
   }
 
   private fun ensureInitialized(promise: Promise, operation: () -> Unit) {
-    synchronized(initLock) {
+    val action: Int = synchronized(initLock) {
       when {
-        isInitialized -> {
-          try {
-            operation()
-          } catch (e: Exception) {
-            promise.reject("speech_error", e.message ?: "Unknown error")
-          }
-        }
+        isInitialized -> 0
         isInitializing -> {
           pendingOperations.add(Pair(operation, promise))
+          1
         }
         else -> {
           pendingOperations.add(Pair(operation, promise))
-          initializeTTS()
+          2
         }
       }
+    }
+    when (action) {
+      0 -> try {
+        operation()
+      } catch (e: Exception) {
+        promise.reject("speech_error", e.message ?: "Unknown error")
+      }
+      2 -> initializeTTS()
     }
   }
 
   private fun applyGlobalOptions() {
     if (!isInitialized) return
+    applyGlobalOptionsInternal()
+  }
+
+  private fun applyGlobalOptionsInternal() {
     try {
       globalOptions["language"]?.let {
         synthesizer.setLanguage(Locale.forLanguageTag(it as String))
@@ -396,7 +473,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       globalOptions["voice"]?.let { voiceId ->
         synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
       }
-    } catch (e: Exception) {}
+    } catch (e: Throwable) {}
   }
 
   private fun applyOptions(options: Map<String, Any>) {
@@ -409,7 +486,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       temp["voice"]?.let { voiceId ->
         synthesizer.voices?.find { it.name == voiceId }?.let { synthesizer.voice = it }
       }
-    } catch (e: Exception) {}
+    } catch (e: Throwable) {}
   }
 
   private fun getValidatedOptions(options: ReadableMap): Map<String, Any> {
@@ -424,21 +501,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   }
 
   private fun processNextQueueItem() {
-    synchronized(queueLock) {
+    val work = synchronized(queueLock) {
       if (isPaused || !isInitialized) return
       var item = currentUtteranceId?.let { speechQueue[it] }
       if (item == null || (item.status != SpeechStatus.PENDING && item.status != SpeechStatus.PAUSED)) {
         item = speechQueue.values.firstOrNull { it.status == SpeechStatus.PENDING || it.status == SpeechStatus.PAUSED }
         currentUtteranceId = item?.utteranceId
       }
-      if (item == null) {
-        applyGlobalOptions()
-        return
-      }
+      if (item == null) return@synchronized null
       isDucking = getItemDucking(item)
-      activateDuckingSession()
-      applyOptions(item.options)
-      val textToSpeak = if (item.status == SpeechStatus.PAUSED) {
+      val text = if (item.status == SpeechStatus.PAUSED) {
         item.offset = item.position
         isResuming = true
         item.text.substring(item.offset)
@@ -447,14 +519,23 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         item.text
       }
       val queueMode = if (isResuming) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-      try {
-        synthesizer.speak(textToSpeak, queueMode, getSpeechParams(), item.utteranceId)
-      } catch (e: Exception) {
-        item.status = SpeechStatus.ERROR
+      SpeakWork(item, text, queueMode)
+    }
+    if (work == null) {
+      applyGlobalOptions()
+      return
+    }
+    activateDuckingSession()
+    applyOptions(work.item.options)
+    try {
+      synthesizer.speak(work.text, work.queueMode, getSpeechParams(), work.item.utteranceId)
+    } catch (e: Exception) {
+      synchronized(queueLock) {
+        work.item.status = SpeechStatus.ERROR
         currentUtteranceId = null
         cleanupQueueHeadLocked()
-        processNextQueueItem()
       }
+      processNextQueueItem()
     }
   }
 
@@ -491,14 +572,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   override fun isSpeaking(promise: Promise) {
     ensureInitialized(promise) {
       val isEngineSpeaking = try { synthesizer.isSpeaking } catch (e: Exception) { false }
-      promise.resolve(isEngineSpeaking || isPaused)
+      val paused = synchronized(queueLock) { isPaused }
+      promise.resolve(isEngineSpeaking || paused)
     }
   }
 
   override fun stop(promise: Promise) {
     ensureInitialized(promise) {
       val isEngineSpeaking = try { synthesizer.isSpeaking } catch (e: Exception) { false }
-      if (isEngineSpeaking || isPaused) {
+      val wasPaused = synchronized(queueLock) { isPaused }
+      if (isEngineSpeaking || wasPaused) {
         try { synthesizer.stop() } catch (e: Exception) {}
         deactivateDuckingSession()
         synchronized(queueLock) {
@@ -513,36 +596,41 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
   override fun pause(promise: Promise) {
     ensureInitialized(promise) {
       val isEngineSpeaking = try { synthesizer.isSpeaking } catch (e: Exception) { false }
-      if (!isSupportedPausing || isPaused || !isEngineSpeaking || speechQueue.isEmpty()) {
-        promise.resolve(false)
-      } else {
-        isPaused = true
+      val shouldStop = synchronized(queueLock) {
+        if (isSupportedPausing && !isPaused && isEngineSpeaking && speechQueue.isNotEmpty()) {
+          isPaused = true
+          true
+        } else {
+          false
+        }
+      }
+      if (shouldStop) {
         try { synthesizer.stop() } catch (e: Exception) {}
         deactivateDuckingSession()
-        promise.resolve(true)
       }
+      promise.resolve(shouldStop)
     }
   }
 
   override fun resume(promise: Promise) {
     ensureInitialized(promise) {
-      if (!isSupportedPausing || !isPaused || speechQueue.isEmpty() || currentUtteranceId == null) {
-        promise.resolve(false)
-        return@ensureInitialized
-      }
+      var shouldProcess = false
       synchronized(queueLock) {
+        if (!isSupportedPausing || !isPaused || speechQueue.isEmpty() || currentUtteranceId == null) {
+          return@synchronized
+        }
         val pausedItem = speechQueue.values.firstOrNull { it.status == SpeechStatus.PAUSED }
         if (pausedItem != null) {
           currentUtteranceId = pausedItem.utteranceId
           isDucking = getItemDucking(pausedItem)
           isPaused = false
-          processNextQueueItem()
-          promise.resolve(true)
+          shouldProcess = true
         } else {
           isPaused = false
-          promise.resolve(false)
         }
       }
+      if (shouldProcess) processNextQueueItem()
+      promise.resolve(shouldProcess)
     }
   }
 
@@ -561,14 +649,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     ensureInitialized(promise) {
       val utteranceId = getUniqueID()
       val item = SpeechQueueItem(text = text, options = emptyMap(), utteranceId = utteranceId)
+      val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
+      var shouldProcess = false
       synchronized(queueLock) {
         speechQueue[utteranceId] = item
-        val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
         if (!engineBusy && !isPaused) {
           currentUtteranceId = utteranceId
-          processNextQueueItem()
+          shouldProcess = true
         }
       }
+      if (shouldProcess) processNextQueueItem()
       promise.resolve(utteranceId)
     }
   }
@@ -589,14 +679,16 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
       val validated = getValidatedOptions(options)
       val utteranceId = getUniqueID()
       val item = SpeechQueueItem(text = text, options = validated, utteranceId = utteranceId)
+      val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
+      var shouldProcess = false
       synchronized(queueLock) {
         speechQueue[utteranceId] = item
-        val engineBusy = try { synthesizer.isSpeaking } catch (e: Exception) { false }
         if (!engineBusy && !isPaused) {
           currentUtteranceId = utteranceId
-          processNextQueueItem()
+          shouldProcess = true
         }
       }
+      if (shouldProcess) processNextQueueItem()
       promise.resolve(utteranceId)
     }
   }
@@ -605,11 +697,12 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
     ensureInitialized(promise) {
       val enginesArray = Arguments.createArray()
       val engines = cachedEngines ?: try { synthesizer.engines } catch (e: Exception) { null }
+      val defaultEngine = try { synthesizer.defaultEngine } catch (e: Exception) { "" }
       engines?.forEach { engine ->
         enginesArray.pushMap(Arguments.createMap().apply {
           putString("name", engine.name)
           putString("label", engine.label)
-          putBoolean("isDefault", engine.name == try { synthesizer.defaultEngine } catch (e: Exception) { "" })
+          putBoolean("isDefault", engine.name == defaultEngine)
         })
       }
       promise.resolve(enginesArray)
@@ -629,7 +722,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
         return@ensureInitialized
       }
       selectedEngine = engineName
-      invalidate()
+      resetSynthesizer()
       synchronized(initLock) { pendingOperations.add(Pair({ promise.resolve(null) }, promise)) }
       initializeTTS()
     }
@@ -652,17 +745,11 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun invalidate() {
     super.invalidate()
+    resetSynthesizer()
     synchronized(initLock) {
-      try {
-        if (::synthesizer.isInitialized) {
-          try { synthesizer.stop() } catch (e: Exception) {}
-          try { synthesizer.shutdown() } catch (e: Exception) {}
-          resetQueueState()
-        }
-      } catch (e: Exception) {}
-      isInitialized = false
-      isInitializing = false
-      clearInitTimeout()
+      initExecutor?.shutdownNow()
+      initExecutor = null
     }
+    rejectPendingOperations()
   }
 }
