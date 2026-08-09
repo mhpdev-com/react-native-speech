@@ -34,7 +34,7 @@ const RootView: React.FC = () => {
     Array<HighlightedSegmentProps>
   >([]);
 
-  const targetId = React.useRef<string>('');
+  const currentId = React.useRef<string>('');
 
   React.useEffect(() => {
     // Speech.configure({silentMode: 'obey', ducking: true});
@@ -43,35 +43,35 @@ const RootView: React.FC = () => {
       setIsStarted(false);
       setIsPaused(false);
       setHighlights([]);
-      targetId.current = '';
+      currentId.current = '';
     };
 
     const startSubscription = Speech.onStart(({id}) => {
-      if (id === targetId.current) {
+      if (id === currentId.current) {
         setIsStarted(true);
         console.log(`Speech ${id} started`);
       }
     });
     const finishSubscription = Speech.onFinish(({id}) => {
-      if (id === targetId.current) {
+      if (id === currentId.current) {
         onSpeechEnd();
         console.log(`Speech ${id} finished`);
       }
     });
     const pauseSubscription = Speech.onPause(({id}) => {
-      if (id === targetId.current) {
+      if (id === currentId.current) {
         setIsPaused(true);
         console.log(`Speech ${id} paused`);
       }
     });
     const resumeSubscription = Speech.onResume(({id}) => {
-      if (id === targetId.current) {
+      if (id === currentId.current) {
         setIsPaused(false);
         console.log(`Speech ${id} resumed`);
       }
     });
     const stoppedSubscription = Speech.onStopped(({id}) => {
-      if (id === targetId.current) {
+      if (id === currentId.current) {
         onSpeechEnd();
         console.log(`Speech ${id} stopped`);
       }
@@ -116,7 +116,8 @@ const RootView: React.FC = () => {
 
   const onStartPress = React.useCallback(async () => {
     const id = await Speech.speak(Introduction);
-    targetId.current = id;
+    console.log('The speak queued with ID:', id);
+    currentId.current = id;
   }, []);
 
   const onHighlightedPress = React.useCallback(
