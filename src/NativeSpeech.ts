@@ -1,5 +1,5 @@
 import {TurboModuleRegistry, type TurboModule} from 'react-native';
-import type {EventEmitter} from 'react-native/Libraries/Types/CodegenTypesNamespace';
+import type {EventEmitter} from '../node_modules/react-native/Libraries/Types/CodegenTypesNamespace';
 
 export type VoiceQuality = 'Default' | 'Enhanced';
 
