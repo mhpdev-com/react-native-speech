@@ -730,7 +730,7 @@ class RNSpeechModule(reactContext: ReactApplicationContext) :
 
   override fun openVoiceDataInstaller(promise: Promise) {
     try {
-      val activity = currentActivity ?: throw Exception("The current activity is not available to launch the installer.")
+      val activity = reactApplicationContext.currentActivity ?: throw Exception("The current activity is not available to launch the installer.")
       val intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
       if (intent.resolveActivity(activity.packageManager) != null) {
         activity.startActivity(intent)
