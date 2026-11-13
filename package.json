@@ -60,7 +60,7 @@
   "bugs": {
     "url": "https://github.com/mhpdev-com/react-native-speech/issues"
   },
-  "homepage": "https://github.com/mhpdev-com/react-native-speech#readme",
+  "homepage": "https://docs.mhpdev.com/react-native-speech",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },

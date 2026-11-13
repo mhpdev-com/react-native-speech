@@ -1,13 +1,13 @@
 <p align="center">
   <a href="https://mhpdev.com" target="_blank">
-    <img src="./docs/banner.png" alt="React Native Speech Banner" style="max-width:100%;height:auto;" />
+    <img src="./images/banner.png" alt="React Native Speech Banner" style="max-width:100%;height:auto;" />
   </a>
 </p>
 
 A high-performance text-to-speech library built for bare React Native and Expo, compatible with Android and iOS. It enables seamless speech management and provides events for detailed synthesis management.
 
 <div align="center">
-  <a href="./docs/USAGE.md">Documentation</a> · <a href="./example/">Example</a>
+  <a href="https://docs.mhpdev.com/react-native-speech">Documentation</a> · <a href="./example/">Example</a>
 </div>
 <br/>
 
@@ -31,7 +31,7 @@ A high-performance text-to-speech library built for bare React Native and Expo, 
 
 - 📡 &nbsp;**Rich Events** - Comprehensive event system for precise synthesis lifecycle monitoring
 
-- 💅 &nbsp;**Visual Feedback** - Customizable [HighlightedText](./docs/USAGE.md#highlightedtext) component for real-time speech visualization
+- 💅 &nbsp;**Visual Feedback** - Customizable [HighlightedText](https://docs.mhpdev.com/react-native-speech/highlighted-text) component for real-time speech visualization
 
 - ✅ &nbsp;**Type Safety** - Fully written in TypeScript with complete type definitions
 
@@ -75,7 +75,7 @@ For Expo projects, follow these steps:
 
 ## Usage
 
-To learn how to use the library, check out the [usage section](./docs/USAGE.md).
+To learn how to use the library, check out the [documentation](https://docs.mhpdev.com/react-native-speech).
 
 ## Quick Start
 
@@ -135,7 +135,7 @@ To mock the package's methods and components using the default mock configuratio
 
 ## Contributing
 
-See the [contributing guide](./docs/CONTRIBUTING.md) to learn how to contribute to the repository and the development workflow.
+See the [contributing guide](./CONTRIBUTING.md) to learn how to contribute to the repository and the development workflow.
 
 ## License
 
